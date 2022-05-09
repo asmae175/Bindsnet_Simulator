@@ -139,7 +139,7 @@ class NoOp(LearningRule):
         super().update()
 
 
-class PostPre(LearningRule):
+class Additive(LearningRule):
     # language=rst
     """
     Simple STDP rule involving both pre- and post-synaptic spiking activity. By default,
@@ -195,7 +195,7 @@ class PostPre(LearningRule):
             raise NotImplementedError(
                 "This learning rule is not supported for this Connection type."
             )
-
+        print("Additive")
     def _local_connection1d_update(self, **kwargs) -> None:
         # language=rst
         """
@@ -575,7 +575,7 @@ class PostPre(LearningRule):
         super().update()
 
 
-class WeightDependentPostPre(LearningRule):
+class Multiplicative(LearningRule):
     # language=rst
     """
     STDP rule involving both pre- and post-synaptic spiking activity. The post-synaptic
@@ -636,7 +636,7 @@ class WeightDependentPostPre(LearningRule):
             raise NotImplementedError(
                 "This learning rule is not supported for this Connection type."
             )
-
+        print("Multiplicative")
     def _connection_update(self, **kwargs) -> None:
         # language=rst
         """
@@ -3083,5 +3083,440 @@ class Rmax(LearningRule):
 
         # Compute weight update.
         self.connection.w += self.nu[0] * reward * self.eligibility_trace
+
+        super().update()
+class Gutig(LearningRule):
+    # language=rst
+    """
+    STDP rule involving both pre- and post-synaptic spiking activity. The post-synaptic
+    update is positive and the pre- synaptic update is negative, and both are dependent
+    on the magnitude of the synaptic weights.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = 0.0,
+        mu: float = 0.4,
+        **kwargs
+    ) -> None:
+        # language=rst
+        """
+        Constructor for ``WeightDependentPostPre`` learning rule.
+
+        :param connection: An ``AbstractConnection`` object whose weights the
+            ``WeightDependentPostPre`` learning rule will modify.
+        :param nu: Single or pair of learning rates for pre- and post-synaptic events.
+        :param reduction: Method for reducing parameter updates along the batch
+            dimension.
+        :param weight_decay: Constant multiple to decay weights by on each iteration.
+        """
+        super().__init__(
+            connection=connection,
+            nu=nu,
+            reduction=reduction,
+            weight_decay=weight_decay,
+            mu=mu,
+            **kwargs
+        )
+
+        self.mu = 0.4
+        assert self.source.traces, "Pre-synaptic nodes must record spike traces."
+        assert (
+            connection.wmin != -np.inf and connection.wmax != np.inf
+        ), "Connection must define finite wmin and wmax."
+
+        self.wmin = connection.wmin
+        self.wmax = connection.wmax
+
+        if isinstance(connection, (Connection, LocalConnection)):
+            self.update = self._connection_update
+        elif isinstance(connection, Conv2dConnection):
+            self.update = self._conv2d_connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+        print("Gutig")
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Connection`` subclass of ``AbstractConnection``
+        class.
+        """
+        batch_size = self.source.batch_size
+
+        source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float()
+        source_x = self.source.x.view(batch_size, -1).unsqueeze(2)
+        target_s = self.target.s.view(batch_size, -1).unsqueeze(1).float()
+        target_x = self.target.x.view(batch_size, -1).unsqueeze(1)
+
+
+        update = 0
+        # print("self nu ")
+        # print(self.nu)
+        # Pre-synaptic update.
+        if self.nu[0]:
+            outer_product = self.reduction(torch.bmm(source_s, target_x), dim=0)
+            update -= self.nu[0] * outer_product * ((self.connection.w - self.wmin)**self.mu)
+            # print("Pre-synaptic update")
+            # print(outer_product)
+        # Post-synaptic update.
+        if self.nu[1]:
+            outer_product = self.reduction(torch.bmm(source_x, target_s), dim=0)
+            update += self.nu[1] * outer_product * ((self.wmax - self.connection.w)**self.mu)
+            # print("Post-synaptic update")
+        #print(self.connection.w[40])
+        self.connection.w += update
+
+        super().update()
+
+    def _conv2d_connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Conv2dConnection`` subclass of
+        ``AbstractConnection`` class.
+        """
+        # Get convolutional layer parameters.
+        (
+            out_channels,
+            in_channels,
+            kernel_height,
+            kernel_width,
+        ) = self.connection.w.size()
+        padding, stride = self.connection.padding, self.connection.stride
+        batch_size = self.source.batch_size
+
+        # Reshaping spike traces and spike occurrences.
+        source_x = im2col_indices(
+            self.source.x, kernel_height, kernel_width, padding=padding, stride=stride
+        )
+        target_x = self.target.x.view(batch_size, out_channels, -1)
+        source_s = im2col_indices(
+            self.source.s.float(),
+            kernel_height,
+            kernel_width,
+            padding=padding,
+            stride=stride,
+        )
+        target_s = self.target.s.view(batch_size, out_channels, -1).float()
+
+        update = 0
+
+        # Pre-synaptic update.
+        if self.nu[0]:
+            pre = self.reduction(
+                torch.bmm(target_x, source_s.permute((0, 2, 1))), dim=0
+            )
+            update -= (
+                self.nu[0]
+                * pre.view(self.connection.w.size())
+                * ((self.connection.w - self.wmin))**self.mu
+            )
+
+        # Post-synaptic update.
+        if self.nu[1]:
+            post = self.reduction(
+                torch.bmm(target_s, source_x.permute((0, 2, 1))), dim=0
+            )
+            update += (
+                self.nu[1]
+                * post.view(self.connection.w.size())
+                * (self.wmax - self.connection.w)**self.mu
+            )
+
+        self.connection.w += update
+
+        super().update()
+class Rossum(LearningRule):
+    # language=rst
+    """
+    STDP rule involving both pre- and post-synaptic spiking activity. The post-synaptic
+    update is positive and the pre- synaptic update is negative, and both are dependent
+    on the magnitude of the synaptic weights.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = 0.0,
+        mu: float = 0.4,
+        **kwargs
+    ) -> None:
+        # language=rst
+        """
+        Constructor for ``WeightDependentPostPre`` learning rule.
+
+        :param connection: An ``AbstractConnection`` object whose weights the
+            ``WeightDependentPostPre`` learning rule will modify.
+        :param nu: Single or pair of learning rates for pre- and post-synaptic events.
+        :param reduction: Method for reducing parameter updates along the batch
+            dimension.
+        :param weight_decay: Constant multiple to decay weights by on each iteration.
+        """
+        super().__init__(
+            connection=connection,
+            nu=nu,
+            reduction=reduction,
+            weight_decay=weight_decay,
+            mu=mu,
+            **kwargs
+        )
+
+        self.mu = 0.4
+        assert self.source.traces, "Pre-synaptic nodes must record spike traces."
+        assert (
+            connection.wmin != -np.inf and connection.wmax != np.inf
+        ), "Connection must define finite wmin and wmax."
+
+        self.wmin = connection.wmin
+        self.wmax = connection.wmax
+
+        if isinstance(connection, (Connection, LocalConnection)):
+            self.update = self._connection_update
+        elif isinstance(connection, Conv2dConnection):
+            self.update = self._conv2d_connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+        print("Rossum")
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Connection`` subclass of ``AbstractConnection``
+        class.
+        """
+        batch_size = self.source.batch_size
+
+        source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float()
+        source_x = self.source.x.view(batch_size, -1).unsqueeze(2)
+        target_s = self.target.s.view(batch_size, -1).unsqueeze(1).float()
+        target_x = self.target.x.view(batch_size, -1).unsqueeze(1)
+
+
+        update = 0
+        # print("self nu ")
+        # print(self.nu)
+        # Pre-synaptic update.
+        if self.nu[0]:
+            outer_product = self.reduction(torch.bmm(source_s, target_x), dim=0)
+            update -= self.nu[0] * outer_product * self.connection.w
+            # print("Pre-synaptic update")
+            # print(outer_product)
+        # Post-synaptic update.
+        if self.nu[1]:
+            outer_product = self.reduction(torch.bmm(source_x, target_s), dim=0)
+            update += self.nu[1] * outer_product
+            # print("Post-synaptic update")
+        #print(self.connection.w[40])
+        self.connection.w += update
+
+        super().update()
+
+    def _conv2d_connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Conv2dConnection`` subclass of
+        ``AbstractConnection`` class.
+        """
+        # Get convolutional layer parameters.
+        (
+            out_channels,
+            in_channels,
+            kernel_height,
+            kernel_width,
+        ) = self.connection.w.size()
+        padding, stride = self.connection.padding, self.connection.stride
+        batch_size = self.source.batch_size
+
+        # Reshaping spike traces and spike occurrences.
+        source_x = im2col_indices(
+            self.source.x, kernel_height, kernel_width, padding=padding, stride=stride
+        )
+        target_x = self.target.x.view(batch_size, out_channels, -1)
+        source_s = im2col_indices(
+            self.source.s.float(),
+            kernel_height,
+            kernel_width,
+            padding=padding,
+            stride=stride,
+        )
+        target_s = self.target.s.view(batch_size, out_channels, -1).float()
+
+        update = 0
+
+        # Pre-synaptic update.
+        if self.nu[0]:
+            pre = self.reduction(
+                torch.bmm(target_x, source_s.permute((0, 2, 1))), dim=0
+            )
+            update -= (
+                self.nu[0]
+                * pre.view(self.connection.w.size())
+                * ((self.connection.w - self.wmin))**self.mu
+            )
+
+        # Post-synaptic update.
+        if self.nu[1]:
+            post = self.reduction(
+                torch.bmm(target_s, source_x.permute((0, 2, 1))), dim=0
+            )
+            update += (
+                self.nu[1]
+                * post.view(self.connection.w.size())
+                * (self.wmax - self.connection.w)**self.mu
+            )
+
+        self.connection.w += update
+
+        super().update()
+class Powerlaw(LearningRule):
+    # language=rst
+    """
+    STDP rule involving both pre- and post-synaptic spiking activity. The post-synaptic
+    update is positive and the pre- synaptic update is negative, and both are dependent
+    on the magnitude of the synaptic weights.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = 0.0,
+        mu: float = 0.4,
+        **kwargs
+    ) -> None:
+        # language=rst
+        """
+        Constructor for ``WeightDependentPostPre`` learning rule.
+
+        :param connection: An ``AbstractConnection`` object whose weights the
+            ``WeightDependentPostPre`` learning rule will modify.
+        :param nu: Single or pair of learning rates for pre- and post-synaptic events.
+        :param reduction: Method for reducing parameter updates along the batch
+            dimension.
+        :param weight_decay: Constant multiple to decay weights by on each iteration.
+        """
+        super().__init__(
+            connection=connection,
+            nu=nu,
+            reduction=reduction,
+            weight_decay=weight_decay,
+            mu=mu,
+            **kwargs
+        )
+
+        self.mu = 0.4
+        assert self.source.traces, "Pre-synaptic nodes must record spike traces."
+        assert (
+            connection.wmin != -np.inf and connection.wmax != np.inf
+        ), "Connection must define finite wmin and wmax."
+
+        self.wmin = connection.wmin
+        self.wmax = connection.wmax
+
+        if isinstance(connection, (Connection, LocalConnection)):
+            self.update = self._connection_update
+        elif isinstance(connection, Conv2dConnection):
+            self.update = self._conv2d_connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+        print("Powerlaw")
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Connection`` subclass of ``AbstractConnection``
+        class.
+        """
+        batch_size = self.source.batch_size
+
+        source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float()
+        source_x = self.source.x.view(batch_size, -1).unsqueeze(2)
+        target_s = self.target.s.view(batch_size, -1).unsqueeze(1).float()
+        target_x = self.target.x.view(batch_size, -1).unsqueeze(1)
+
+
+        update = 0
+        # print("self nu ")
+        # print(self.nu)
+        # Pre-synaptic update.
+        if self.nu[0]:
+            outer_product = self.reduction(torch.bmm(source_s, target_x), dim=0)
+            update -= self.nu[0] * outer_product * (self.connection.w - self.wmin)
+            # print("Pre-synaptic update")
+            # print(outer_product)
+        # Post-synaptic update.
+        if self.nu[1]:
+            outer_product = self.reduction(torch.bmm(source_x, target_s), dim=0)
+            update += self.nu[1] * outer_product * ((self.wmax - self.connection.w)**self.mu)
+            # print("Post-synaptic update")
+        #print(self.connection.w[40])
+        self.connection.w += update
+
+        super().update()
+
+    def _conv2d_connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Conv2dConnection`` subclass of
+        ``AbstractConnection`` class.
+        """
+        # Get convolutional layer parameters.
+        (
+            out_channels,
+            in_channels,
+            kernel_height,
+            kernel_width,
+        ) = self.connection.w.size()
+        padding, stride = self.connection.padding, self.connection.stride
+        batch_size = self.source.batch_size
+
+        # Reshaping spike traces and spike occurrences.
+        source_x = im2col_indices(
+            self.source.x, kernel_height, kernel_width, padding=padding, stride=stride
+        )
+        target_x = self.target.x.view(batch_size, out_channels, -1)
+        source_s = im2col_indices(
+            self.source.s.float(),
+            kernel_height,
+            kernel_width,
+            padding=padding,
+            stride=stride,
+        )
+        target_s = self.target.s.view(batch_size, out_channels, -1).float()
+
+        update = 0
+
+        # Pre-synaptic update.
+        if self.nu[0]:
+            pre = self.reduction(
+                torch.bmm(target_x, source_s.permute((0, 2, 1))), dim=0
+            )
+            update -= (
+                self.nu[0]
+                * pre.view(self.connection.w.size())
+                * ((self.connection.w - self.wmin))**self.mu
+            )
+
+        # Post-synaptic update.
+        if self.nu[1]:
+            post = self.reduction(
+                torch.bmm(target_s, source_x.permute((0, 2, 1))), dim=0
+            )
+            update += (
+                self.nu[1]
+                * post.view(self.connection.w.size())
+                * (self.wmax - self.connection.w)**self.mu
+            )
+
+        self.connection.w += update
 
         super().update()
