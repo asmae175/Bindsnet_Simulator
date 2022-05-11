@@ -192,6 +192,7 @@ class DiehlAndCook2015(Network):
 
     def __init__(
         self,
+        Variant: LearningRule,
         n_inpt: int,
         n_neurons: int = 100,
         exc: float = 22.5,
@@ -271,7 +272,7 @@ class DiehlAndCook2015(Network):
             source=input_layer,
             target=exc_layer,
             w=w,
-            update_rule= Multiplicative,
+            update_rule= Variant,
             nu=nu,
             reduction=reduction,
             wmin=wmin,
