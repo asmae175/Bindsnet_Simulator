@@ -5,6 +5,8 @@ from bindsnet.models.models import (
     IncreasingInhibitionNetwork,
     LocallyConnectedNetwork,
     TwoLayerNetwork,
+    HaoAndHuang2019v1,
+    HaoAndHuang2019v2,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "DiehlAndCook2015",
     "IncreasingInhibitionNetwork",
     "LocallyConnectedNetwork",
+    "HaoAndHuang2019v1",
+    "HaoAndHuang2019v2",
 ]

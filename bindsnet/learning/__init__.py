@@ -10,6 +10,7 @@ from bindsnet.learning.learning import (
     Rossum,
     Gutig,
     Powerlaw,
+    DA_STDP,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "MSTDP",
     "MSTDPET",
     "Rmax",
+    "DA_STDP",
 ]
